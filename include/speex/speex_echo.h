@@ -59,6 +59,19 @@ extern "C" {
 /** Get impulse response (int32[]) */
 #define SPEEX_ECHO_GET_IMPULSE_RESPONSE 29
 
+/** Set the playback delay used to align the far-end reference (spx_int32_t,
+ * in samples). This does not add delay to the near-end output. Setting this
+ * value disables automatic delay tracking. */
+#define SPEEX_ECHO_SET_PLAYBACK_DELAY 30
+/** Get the current playback delay used for reference alignment (spx_int32_t,
+ * in samples) */
+#define SPEEX_ECHO_GET_PLAYBACK_DELAY 31
+/** Enable or disable automatic playback delay tracking (spx_int32_t, non-zero
+ * enables). Automatic tracking is enabled by default. */
+#define SPEEX_ECHO_SET_ADAPTIVE_DELAY 32
+/** Get whether automatic playback delay tracking is enabled (spx_int32_t) */
+#define SPEEX_ECHO_GET_ADAPTIVE_DELAY 33
+
 /** Internal echo canceller state. Should never be accessed directly. */
 struct SpeexEchoState_;
 
@@ -90,8 +103,9 @@ SpeexEchoState *speex_echo_state_init_mc(int frame_size, int filter_length, int 
 */
 void speex_echo_state_destroy(SpeexEchoState *st);
 
-/** Performs echo cancellation a frame, based on the audio sent to the speaker (no delay is added
- * to playback in this form)
+/** Performs echo cancellation a frame, based on the audio sent to the speaker.
+ * The echo canceller tracks the playback delay automatically. This form does
+ * not add delay to the near-end output.
  *
  * @param st Echo canceller state
  * @param rec Signal from the microphone (near end + far end echo)
@@ -103,8 +117,8 @@ void speex_echo_cancellation(SpeexEchoState *st, const spx_int16_t *rec, const s
 /** Performs echo cancellation a frame (deprecated) */
 void speex_echo_cancel(SpeexEchoState *st, const spx_int16_t *rec, const spx_int16_t *play, spx_int16_t *out, spx_int32_t *Yout);
 
-/** Perform echo cancellation using internal playback buffer, which is delayed by two frames
- * to account for the delay introduced by most soundcards (but it could be off!)
+/** Perform echo cancellation using the internal playback history. The history
+ * is automatically aligned to the delay between playback and capture.
  * @param st Echo canceller state
  * @param rec Signal from the microphone (near end + far end echo)
  * @param out Returns near-end signal with echo removed

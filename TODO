@@ -4,7 +4,6 @@ Major points:
 - Get AGC to work in fixed-point even if not totally converted
 - Stabilise all APIs (need feedback)
 - Short-term estimate in jitter buffer
-- Control delay in new AEC API.
 - NaN checks?
 - Better error reporting
 - Make kiss-fft 32-bit safe

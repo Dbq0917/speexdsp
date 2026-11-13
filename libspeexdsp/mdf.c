@@ -117,9 +117,17 @@ static const spx_float_t VAR_BACKTRACK = 4.f;
 #endif
 
 
-#define PLAYBACK_DELAY 2
+/* Maximum bulk delay that can be compensated without increasing the adaptive
+   filter length. This is a sample count, so it covers 500 ms up to 48 kHz. */
+#define MAX_DELAY_SAMPLES 24000
+#define DELAY_CORR_FRAMES 5
+#define DELAY_CONFIRM_FRAMES 3
+#define DELAY_MIN_CORRELATION QCONST16(.35f,15)
+#define DELAY_MIN_PROMINENCE 115
 
 void speex_echo_get_residual(SpeexEchoState *st, spx_word32_t *Yout, int len);
+static void echo_state_reset_adaptive(SpeexEchoState *st);
+static void echo_cancel_core(SpeexEchoState *st, const spx_int16_t *in, const spx_int16_t *far_end, spx_int16_t *out);
 
 
 /** Speex echo cancellation state. */
@@ -178,10 +186,20 @@ struct SpeexEchoState_ {
    spx_word16_t notch_radius;
    spx_mem_t *notch_mem;
 
-   /* NOTE: If you only use speex_echo_cancel() and want to save some memory, remove this */
-   spx_int16_t *play_buf;
-   int play_buf_pos;
-   int play_buf_started;
+   /* Far-end history used to compensate the unknown device/soundcard delay.
+      The adaptive MDF filter only needs to model the room response after
+      this bulk delay has been removed. */
+   spx_int16_t *delay_buf;
+   spx_int16_t *delay_frame;
+   spx_int16_t *delay_mic;
+   int delay_buf_frames;
+   int delay_buf_pos;
+   int delay_buf_fill;
+   int delay_mic_pos;
+   int delay_frames;
+   int delay_candidate;
+   int delay_candidate_count;
+   int delay_auto;
 };
 
 static inline void filter_dc_notch16(const spx_int16_t *in, spx_word16_t radius, spx_word16_t *out, int len, spx_mem_t *mem, int stride)
@@ -513,15 +531,27 @@ EXPORT SpeexEchoState *speex_echo_state_init_mc(int frame_size, int filter_lengt
    st->Dvar1 = st->Dvar2 = FLOAT_ZERO;
 #endif
 
-   st->play_buf = (spx_int16_t*)speex_alloc(K*(PLAYBACK_DELAY+1)*st->frame_size*sizeof(spx_int16_t));
-   st->play_buf_pos = PLAYBACK_DELAY*st->frame_size;
-   st->play_buf_started = 0;
+   st->delay_buf_frames = MAX_DELAY_SAMPLES/st->frame_size + 2;
+   if (st->delay_buf_frames < DELAY_CORR_FRAMES+1)
+      st->delay_buf_frames = DELAY_CORR_FRAMES+1;
+   st->delay_buf = (spx_int16_t*)speex_alloc(K*st->delay_buf_frames*st->frame_size*sizeof(spx_int16_t));
+   st->delay_frame = (spx_int16_t*)speex_alloc(K*st->frame_size*sizeof(spx_int16_t));
+   st->delay_mic = (spx_int16_t*)speex_alloc(DELAY_CORR_FRAMES*st->frame_size*sizeof(spx_int16_t));
+   st->delay_buf_pos = 0;
+   st->delay_buf_fill = 0;
+   st->delay_mic_pos = 0;
+   st->delay_frames = 0;
+   st->delay_candidate = 0;
+   st->delay_candidate_count = 0;
+   st->delay_auto = 1;
 
    return st;
 }
 
-/** Resets echo canceller state */
-EXPORT void speex_echo_state_reset(SpeexEchoState *st)
+/* Reset the adaptive filter and the recursive statistics, but keep the
+   playback/capture history. This is used by a full state reset and when an
+   application explicitly selects a new fixed delay. */
+static void echo_state_reset_adaptive(SpeexEchoState *st)
 {
    int i, M, N, C, K;
    st->cancel_count=0;
@@ -530,13 +560,13 @@ EXPORT void speex_echo_state_reset(SpeexEchoState *st)
    M = st->M;
    C=st->C;
    K=st->K;
-   for (i=0;i<N*M;i++)
+   for (i=0;i<N*M*C*K;i++)
       st->W[i] = 0;
 #ifdef TWO_PATH
-   for (i=0;i<N*M;i++)
+   for (i=0;i<N*M*C*K;i++)
       st->foreground[i] = 0;
 #endif
-   for (i=0;i<N*(M+1);i++)
+   for (i=0;i<N*(M+1)*K;i++)
       st->X[i] = 0;
    for (i=0;i<=st->frame_size;i++)
    {
@@ -572,10 +602,25 @@ EXPORT void speex_echo_state_reset(SpeexEchoState *st)
    st->Davg1 = st->Davg2 = 0;
    st->Dvar1 = st->Dvar2 = FLOAT_ZERO;
 #endif
-   for (i=0;i<3*st->frame_size;i++)
-      st->play_buf[i] = 0;
-   st->play_buf_pos = PLAYBACK_DELAY*st->frame_size;
-   st->play_buf_started = 0;
+}
+
+/** Resets echo canceller state */
+EXPORT void speex_echo_state_reset(SpeexEchoState *st)
+{
+   int i;
+   echo_state_reset_adaptive(st);
+
+   for (i=0;i<st->K*st->delay_buf_frames*st->frame_size;i++)
+      st->delay_buf[i] = 0;
+   st->delay_buf_pos = 0;
+   st->delay_buf_fill = 0;
+   for (i=0;i<DELAY_CORR_FRAMES*st->frame_size;i++)
+      st->delay_mic[i] = 0;
+   st->delay_mic_pos = 0;
+   if (st->delay_auto)
+      st->delay_frames = 0;
+   st->delay_candidate = 0;
+   st->delay_candidate_count = 0;
 
 }
 
@@ -616,7 +661,9 @@ EXPORT void speex_echo_state_destroy(SpeexEchoState *st)
    speex_free(st->memE);
    speex_free(st->notch_mem);
 
-   speex_free(st->play_buf);
+   speex_free(st->delay_buf);
+   speex_free(st->delay_frame);
+   speex_free(st->delay_mic);
    speex_free(st);
 
 #ifdef DUMP_ECHO_CANCEL_DATA
@@ -627,53 +674,219 @@ EXPORT void speex_echo_state_destroy(SpeexEchoState *st)
 #endif
 }
 
+static unsigned long long delay_isqrt(unsigned long long x)
+{
+   unsigned long long root = 0;
+   unsigned long long bit = (unsigned long long)1<<62;
+   while (bit > x)
+      bit >>= 2;
+   while (bit != 0)
+   {
+      if (x >= root+bit)
+      {
+         x -= root+bit;
+         root = (root>>1)+bit;
+      } else {
+         root >>= 1;
+      }
+      bit >>= 2;
+   }
+   return root;
+}
+
+static void delay_append_ref(SpeexEchoState *st, const spx_int16_t *far_end)
+{
+   int i, len;
+   len = st->K*st->frame_size;
+   for (i=0;i<len;i++)
+      st->delay_buf[st->delay_buf_pos*len+i] = far_end[i];
+   st->delay_buf_pos++;
+   if (st->delay_buf_pos >= st->delay_buf_frames)
+      st->delay_buf_pos = 0;
+   if (st->delay_buf_fill < st->delay_buf_frames)
+      st->delay_buf_fill++;
+}
+
+static void delay_append_mic(SpeexEchoState *st, const spx_int16_t *in)
+{
+   int i, n, C;
+   n = st->frame_size;
+   C = st->C;
+   for (i=0;i<(DELAY_CORR_FRAMES-1)*n;i++)
+      st->delay_mic[i] = st->delay_mic[i+n];
+   for (i=0;i<n;i++)
+      st->delay_mic[(DELAY_CORR_FRAMES-1)*n+i] = in[i*C];
+   if (st->delay_mic_pos < DELAY_CORR_FRAMES)
+      st->delay_mic_pos++;
+}
+
+static const spx_int16_t *delay_history_frame(SpeexEchoState *st, int frames_ago)
+{
+   int pos;
+   pos = st->delay_buf_pos-1-frames_ago;
+   while (pos < 0)
+      pos += st->delay_buf_frames;
+   return st->delay_buf + pos*st->K*st->frame_size;
+}
+
+static int delay_max_frames(SpeexEchoState *st)
+{
+   int max_frames;
+   max_frames = st->sampling_rate*500/(1000*st->frame_size);
+   if (max_frames >= st->delay_buf_frames)
+      max_frames = st->delay_buf_frames-1;
+   return max_frames;
+}
+
+static spx_word16_t delay_correlation_score(unsigned long long corr,
+      unsigned long long energy_mic, unsigned long long energy_ref)
+{
+   unsigned long long den;
+   spx_word16_t score;
+   if (energy_mic == 0 || energy_ref == 0)
+      return 0;
+   den = delay_isqrt(energy_mic)*delay_isqrt(energy_ref);
+   if (den == 0)
+      return 0;
+   corr = (corr*32767+den/2)/den;
+   if (corr > 32767)
+      corr = 32767;
+   score = (spx_word16_t)corr;
+   return score;
+}
+
+static void delay_estimate(SpeexEchoState *st)
+{
+   int d, i, j, n, K, max_frames, best_d, current_d;
+   spx_word16_t best_score, second_score, current_score, score;
+   spx_word16_t min_corr;
+   const spx_int16_t *ref;
+   int L;
+
+   n = st->frame_size;
+   K = st->K;
+   L = DELAY_CORR_FRAMES;
+   if (st->delay_mic_pos < L || st->delay_buf_fill < L+1)
+      return;
+
+   max_frames = delay_max_frames(st);
+   current_d = st->delay_frames;
+   if (current_d > max_frames)
+      current_d = -1;
+   current_score = 0;
+   best_d = -1;
+   best_score = 0;
+   second_score = 0;
+
+   for (d=0;d<=max_frames;d++)
+   {
+      unsigned long long corr=0, energy_mic=0, energy_ref=0;
+      if (d+L > st->delay_buf_fill)
+         break;
+      for (j=0;j<L;j++)
+      {
+         const spx_int16_t *mic;
+         mic = st->delay_mic+j*n;
+         ref = delay_history_frame(st, d+(L-1-j));
+         for (i=0;i<n;i++)
+         {
+            long long m, r;
+            m = mic[i];
+            r = ref[i*K];
+            corr += (unsigned long long)(m*r);
+            energy_mic += (unsigned long long)(m*m);
+            energy_ref += (unsigned long long)(r*r);
+         }
+      }
+      if (energy_mic < (unsigned long long)n*L*100
+            || energy_ref < (unsigned long long)n*L*100)
+         continue;
+      if (corr & ((unsigned long long)1<<63))
+         corr = (~corr)+1;
+      score = delay_correlation_score(corr, energy_mic, energy_ref);
+      if (d == current_d)
+         current_score = score;
+      if (score > best_score)
+      {
+         second_score = best_score;
+         best_score = score;
+         best_d = d;
+      } else if (score > second_score)
+      {
+         second_score = score;
+      }
+   }
+
+   min_corr = DELAY_MIN_CORRELATION;
+   if (best_d < 0 || best_score < min_corr
+         || (int)best_score*100 < (int)second_score*DELAY_MIN_PROMINENCE)
+   {
+      st->delay_candidate_count = 0;
+      return;
+   }
+
+   /* Avoid oscillating between adjacent frame-aligned candidates when the
+      real delay falls between two frames. The residual sub-frame delay is
+      handled by the MDF tail. */
+   if (current_d >= 0 && (int)current_score*100 >= (int)best_score*80)
+   {
+      st->delay_candidate_count = 0;
+      return;
+   }
+
+   if (best_d != st->delay_candidate)
+   {
+      st->delay_candidate = best_d;
+      st->delay_candidate_count = 1;
+   } else if (st->delay_candidate_count < DELAY_CONFIRM_FRAMES) {
+      st->delay_candidate_count++;
+   }
+   if (st->delay_candidate_count >= DELAY_CONFIRM_FRAMES
+         && best_d != st->delay_frames)
+   {
+      st->delay_frames = best_d;
+      st->delay_candidate_count = 0;
+   }
+}
+
+static void delay_select_ref(SpeexEchoState *st)
+{
+   int i, len;
+   len = st->K*st->frame_size;
+   if (st->delay_frames >= st->delay_buf_fill)
+   {
+      for (i=0;i<len;i++)
+         st->delay_frame[i] = 0;
+   } else {
+      const spx_int16_t *ref;
+      ref = delay_history_frame(st, st->delay_frames);
+      for (i=0;i<len;i++)
+         st->delay_frame[i] = ref[i];
+   }
+}
+
 EXPORT void speex_echo_capture(SpeexEchoState *st, const spx_int16_t *rec, spx_int16_t *out)
 {
-   int i;
-   /*speex_warning_int("capture with fill level ", st->play_buf_pos/st->frame_size);*/
-   st->play_buf_started = 1;
-   if (st->play_buf_pos>=st->frame_size)
+   int i, len;
+   len = st->C*st->frame_size;
+   delay_append_mic(st, rec);
+   if (st->delay_auto)
+      delay_estimate(st);
+   if (st->delay_buf_fill > st->delay_frames)
    {
-      speex_echo_cancellation(st, rec, st->play_buf, out);
-      st->play_buf_pos -= st->frame_size;
-      for (i=0;i<st->play_buf_pos;i++)
-         st->play_buf[i] = st->play_buf[i+st->frame_size];
+      delay_select_ref(st);
+      echo_cancel_core(st, rec, st->delay_frame, out);
    } else {
-      speex_warning("No playback frame available (your application is buggy and/or got xruns)");
-      if (st->play_buf_pos!=0)
-      {
-         speex_warning("internal playback buffer corruption?");
-         st->play_buf_pos = 0;
-      }
-      for (i=0;i<st->frame_size;i++)
+      if (st->delay_buf_fill > 0)
+         speex_warning("No playback frame available (your application is buggy and/or got xruns)");
+      for (i=0;i<len;i++)
          out[i] = rec[i];
    }
 }
 
 EXPORT void speex_echo_playback(SpeexEchoState *st, const spx_int16_t *play)
 {
-   /*speex_warning_int("playback with fill level ", st->play_buf_pos/st->frame_size);*/
-   if (!st->play_buf_started)
-   {
-      speex_warning("discarded first playback frame");
-      return;
-   }
-   if (st->play_buf_pos<=PLAYBACK_DELAY*st->frame_size)
-   {
-      int i;
-      for (i=0;i<st->frame_size;i++)
-         st->play_buf[st->play_buf_pos+i] = play[i];
-      st->play_buf_pos += st->frame_size;
-      if (st->play_buf_pos <= (PLAYBACK_DELAY-1)*st->frame_size)
-      {
-         speex_warning("Auto-filling the buffer (your application is buggy and/or got xruns)");
-         for (i=0;i<st->frame_size;i++)
-            st->play_buf[st->play_buf_pos+i] = play[i];
-         st->play_buf_pos += st->frame_size;
-      }
-   } else {
-      speex_warning("Had to discard a playback frame (your application is buggy and/or got xruns)");
-   }
+   delay_append_ref(st, play);
 }
 
 /** Performs echo cancellation on a frame (deprecated, last arg now ignored) */
@@ -682,8 +895,9 @@ EXPORT void speex_echo_cancel(SpeexEchoState *st, const spx_int16_t *in, const s
    speex_echo_cancellation(st, in, far_end, out);
 }
 
-/** Performs echo cancellation on a frame */
-EXPORT void speex_echo_cancellation(SpeexEchoState *st, const spx_int16_t *in, const spx_int16_t *far_end, spx_int16_t *out)
+/* Core echo cancellation. The far-end reference must already be aligned to
+   the capture stream. */
+static void echo_cancel_core(SpeexEchoState *st, const spx_int16_t *in, const spx_int16_t *far_end, spx_int16_t *out)
 {
    int i,j, chan, speak;
    int N,M, C, K;
@@ -1186,6 +1400,17 @@ EXPORT void speex_echo_cancellation(SpeexEchoState *st, const spx_int16_t *in, c
 
 }
 
+/** Performs echo cancellation on a frame */
+EXPORT void speex_echo_cancellation(SpeexEchoState *st, const spx_int16_t *in, const spx_int16_t *far_end, spx_int16_t *out)
+{
+   delay_append_ref(st, far_end);
+   delay_append_mic(st, in);
+   if (st->delay_auto)
+      delay_estimate(st);
+   delay_select_ref(st);
+   echo_cancel_core(st, in, st->delay_frame, out);
+}
+
 /* Compute spectrum of estimated echo for use in an echo post-filter */
 void speex_echo_get_residual(SpeexEchoState *st, spx_word32_t *residual_echo, int len)
 {
@@ -1247,6 +1472,35 @@ EXPORT int speex_echo_ctl(SpeexEchoState *st, int request, void *ptr)
          break;
       case SPEEX_ECHO_GET_SAMPLING_RATE:
          (*(int*)ptr) = st->sampling_rate;
+         break;
+      case SPEEX_ECHO_SET_PLAYBACK_DELAY:
+      {
+         int delay, max_delay, frames;
+         delay = *(spx_int32_t*)ptr;
+         max_delay = delay_max_frames(st)*st->frame_size;
+         if (delay < 0)
+            delay = 0;
+         if (delay > max_delay)
+            delay = max_delay;
+         frames = (delay+st->frame_size/2)/st->frame_size;
+         if (frames != st->delay_frames)
+         {
+            st->delay_frames = frames;
+            echo_state_reset_adaptive(st);
+         }
+         st->delay_auto = 0;
+         st->delay_candidate_count = 0;
+         break;
+      }
+      case SPEEX_ECHO_GET_PLAYBACK_DELAY:
+         (*(spx_int32_t*)ptr) = st->delay_frames*st->frame_size;
+         break;
+      case SPEEX_ECHO_SET_ADAPTIVE_DELAY:
+         st->delay_auto = (*(spx_int32_t*)ptr) != 0;
+         st->delay_candidate_count = 0;
+         break;
+      case SPEEX_ECHO_GET_ADAPTIVE_DELAY:
+         (*(spx_int32_t*)ptr) = st->delay_auto;
          break;
       case SPEEX_ECHO_GET_IMPULSE_RESPONSE_SIZE:
          /*FIXME: Implement this for multiple channels */

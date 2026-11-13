@@ -4701,22 +4701,40 @@ for every frame captured.
 \emph on
 speex_echo_playback()
 \emph default
- simply buffers the playback frame so it can be used by 
+ keeps a short history of playback frames so it can be used by
 \emph on
 speex_echo_capture()
 \emph default
- to call 
-\emph on
-speex_echo_cancel()
-\emph default
+ to call the echo canceller.
+ The history is aligned automatically to the playback-to-capture delay,
+ so device buffering does not have to be hard-coded in the application.
+ This avoids wasting the adaptive filter on the bulk delay and lets changes
+ of up to 500 ms be tracked while a call is running.
+ Automatic alignment changes do not interrupt audio capture or playback;
+ the adaptive filter continues to model the room response while the reference
+ cursor is moved to the new delay.
+\end_layout
+
+\begin_layout Standard
+Automatic alignment can be disabled with
+ \family typewriter
+SPEEX_ECHO_SET_ADAPTIVE_DELAY
+\family default
+ and a fixed delay can be selected with
+ \family typewriter
+SPEEX_ECHO_SET_PLAYBACK_DELAY
+\family default
+ (in samples).
+ The current alignment is returned by
+ \family typewriter
+SPEEX_ECHO_GET_PLAYBACK_DELAY
+\family default
 .
- A side effect of using this alternate API is that the playback audio is
- delayed by two frames, which is the normal delay caused by the soundcard.
  When capture and playback are already synchronised, 
 \emph on
 speex_echo_cancellation()
 \emph default
- is preferable since it gives better control on the exact input/echo timing.
+ can be used instead.
 \end_layout
 
 \begin_layout Standard
